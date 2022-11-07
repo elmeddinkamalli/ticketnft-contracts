@@ -1,3 +1,1 @@
 # ticketnft-contracts
-
-Testnet: 0x78dCb5265E199d1C0D9797d5Ed192B2060931F3a

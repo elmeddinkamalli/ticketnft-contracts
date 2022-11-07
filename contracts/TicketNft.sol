@@ -1,34 +1,58 @@
 // SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
 
-pragma solidity >=0.7.0 <0.9.0;
+import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721URIStorageUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721BurnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/CountersUpgradeable.sol";
 
-import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import "@openzeppelin/contracts/utils/Counters.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+contract TicketNFT is
+    Initializable,
+    ERC721Upgradeable,
+    ERC721URIStorageUpgradeable,
+    PausableUpgradeable,
+    OwnableUpgradeable,
+    ERC721BurnableUpgradeable,
+    UUPSUpgradeable
+{
+    using CountersUpgradeable for CountersUpgradeable.Counter;
 
-contract TicketNFT is ERC721, Ownable {
-    using Strings for uint256;
-    using Counters for Counters.Counter;
+    CountersUpgradeable.Counter private _tokenIdCounter;
 
-    Counters.Counter private supply;
-
-    string public uriPrefix = "";
-    string public uriSuffix = ".json";
-    string public hiddenMetadataUri;
-
-    uint256 public createEventCost = 1000000000000000;
-    uint256 public systemPercent = 5;
-
-    bool public paused = true;
-    bool public revealed = false;
+    uint256 public createEventCost;
+    uint256 public systemPercent;
+    bool public creatorsPermission;
 
     struct Event {
         uint256 id;
+        string _centralizedId;
         address creator;
-        string name;
+        string eventURI;
         uint256 maxSupply;
         uint256 pricePerTicket;
+        uint256 saleStarts;
+        uint256 saleEnds;
+        bool paused;
     }
+
+    event createNewEvent(
+        uint256 eventId,
+        string centralizedId,
+        uint256 saleStarts,
+        uint256 saleEnds
+    );
+    event mintingEventTicket(
+        uint256 eventId,
+        uint256 tokenId,
+        uint256 centralizedId
+    );
+    event deletingEvent(uint256 eventId);
+    event burningTicket(uint256 ticketId);
+    event pausingEvent(uint256 eventId, bool paused);
 
     uint256 public eventCount = 0;
     mapping(uint256 => Event) public idToEvent;
@@ -36,79 +60,152 @@ contract TicketNFT is ERC721, Ownable {
     mapping(address => uint256[]) public addressToTickets;
     mapping(uint256 => uint256) public eventTicketSoldCount;
     mapping(uint256 => uint256) public ticketIdToTicketEvent;
-    mapping(address => bool) public eventCreator;
+    mapping(address => bool) public isEventCreator;
     mapping(address => mapping(uint256 => bool)) public hasEventTicket;
+    mapping(uint256 => string) private _tokenURIs;
 
-    constructor() ERC721("TicketNFT", "TNFT") {
-        setHiddenMetadataUri(
-            "ipfs://QmUivQkWwjvLKwPJ9CmZPELSNDNyfN9uKyuptubgYehU8L/hidden.json"
-        );
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
     }
 
     modifier mintCompliance(uint256 eventId, address _address) {
-        require(idToEvent[eventId].id != 0, "Event does not exists!");
+        _checkMintCompliance(eventId, _address);
+        _;
+    }
+
+    function _checkMintCompliance(uint256 eventId, address _address)
+        private
+        view
+    {
+        Event memory _event = idToEvent[eventId];
+        require(_event.id != 0, "Event does not exists!");
+        require(
+            _event.saleEnds == 0 ||
+                (block.timestamp >= _event.saleStarts &&
+                    block.timestamp <= _event.saleEnds),
+            "Sale ended!"
+        );
+        require(!_event.paused, "Sale paused!");
         require(
             !hasEventTicket[_address][eventId],
             "Already got a ticket for this event!"
         );
-        require(idToEvent[eventId].id != 0, "Event does not exists!");
         require(
-            eventTicketSoldCount[eventId] + 1 <= idToEvent[eventId].maxSupply,
+            eventTicketSoldCount[eventId] <= _event.maxSupply,
             "Max supply exceeded!"
         );
-        _;
     }
 
     modifier canCreateEvents(address _address) {
         require(
-            eventCreator[_address] || _address == owner(),
+            !creatorsPermission ||
+                isEventCreator[_address] ||
+                _address == owner(),
             "Not authorized"
         );
         _;
     }
 
-    function totalSupply() public view returns (uint256) {
-        return supply.current();
+    function totalTicketCount() public view returns (uint256) {
+        return _tokenIdCounter.current();
+    }
+
+    function initialize() public initializer {
+        __ERC721_init("TicketNFT", "TNFT");
+        __ERC721URIStorage_init();
+        __Pausable_init();
+        __Ownable_init();
+        __ERC721Burnable_init();
+        __UUPSUpgradeable_init();
+
+        createEventCost = 1000000000000000;
+        systemPercent = 5;
+    }
+
+    function pause() public onlyOwner {
+        _pause();
+    }
+
+    function unpause() public onlyOwner {
+        _unpause();
     }
 
     function createEvent(
-        string memory eventName,
+        string memory eventURI,
+        string memory _centralizedId,
         uint256 maxTicketSupply,
-        uint256 pricePerTicket
+        uint256 pricePerTicket,
+        uint256 saleStarts,
+        uint256 saleEnds
     ) public payable canCreateEvents(msg.sender) returns (uint256) {
         require(
             msg.value == createEventCost || msg.sender == owner(),
             "Cost not set!"
         );
+        require(saleEnds == 0 || saleEnds > saleStarts, "Invalid dates!");
+
         eventCount++;
 
         addressToEvents[msg.sender].push(
             Event(
                 eventCount,
+                _centralizedId,
                 msg.sender,
-                eventName,
+                eventURI,
                 maxTicketSupply,
-                pricePerTicket
+                pricePerTicket,
+                saleStarts,
+                saleEnds,
+                false
             )
         );
 
         idToEvent[eventCount] = Event(
             eventCount,
+            _centralizedId,
             msg.sender,
-            eventName,
+            eventURI,
             maxTicketSupply,
-            pricePerTicket
+            pricePerTicket,
+            saleStarts,
+            saleEnds,
+            false
         );
 
+        emit createNewEvent(eventCount, _centralizedId, saleStarts, saleEnds);
         return eventCount;
     }
 
-    function mintTicket(uint256 _eventId)
-        public
-        payable
-        mintCompliance(_eventId, msg.sender)
-        returns (uint256)
-    {
+    function mintTicketForAddress(
+        uint256 _eventId,
+        address _receiver,
+        string memory _tokenURI,
+        uint256 _centralizedId
+    ) public mintCompliance(_eventId, _receiver) onlyOwner returns (uint256) {
+        uint256 tokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
+        _safeMint(_receiver, tokenId);
+        _setTokenURI(tokenId, _tokenURI);
+
+        addressToTickets[_receiver].push(tokenId);
+
+        ticketIdToTicketEvent[tokenId] = _eventId;
+
+        uint256 soldCount = eventTicketSoldCount[_eventId] + 1;
+        eventTicketSoldCount[_eventId] = soldCount;
+        hasEventTicket[msg.sender][_eventId] = true;
+
+        emit mintingEventTicket(_eventId, tokenId, _centralizedId);
+
+        return tokenId;
+    }
+
+    function mintTicket(
+        uint256 _eventId,
+        string memory _tokenURI,
+        uint256 _centralizedId
+    ) public payable mintCompliance(_eventId, msg.sender) returns (uint256) {
         Event memory _event = idToEvent[_eventId];
         require(
             msg.value == _event.pricePerTicket,
@@ -118,69 +215,22 @@ contract TicketNFT is ERC721, Ownable {
             value: (msg.value * (100 - systemPercent)) / 100
         }("");
         require(hs);
-        supply.increment();
-        _safeMint(msg.sender, supply.current());
 
-        addressToTickets[msg.sender].push(supply.current());
+        uint256 tokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
+        _safeMint(msg.sender, tokenId);
+        _setTokenURI(tokenId, _tokenURI);
 
-        ticketIdToTicketEvent[supply.current()] = _eventId;
+        addressToTickets[msg.sender].push(tokenId);
 
-        uint256 soldCount = eventTicketSoldCount[_eventId] + 1;
-        eventTicketSoldCount[_eventId] = soldCount;
-        hasEventTicket[msg.sender][_eventId] = true;
-        return supply.current();
-    }
-
-    function mintTicketForAddress(uint256 _eventId, address _receiver)
-        public
-        mintCompliance(_eventId, _receiver)
-        onlyOwner
-        returns (uint256)
-    {
-        supply.increment();
-        _safeMint(_receiver, supply.current());
-
-        addressToTickets[_receiver].push(supply.current());
-
-        ticketIdToTicketEvent[supply.current()] = _eventId;
+        ticketIdToTicketEvent[tokenId] = _eventId;
 
         uint256 soldCount = eventTicketSoldCount[_eventId] + 1;
         eventTicketSoldCount[_eventId] = soldCount;
         hasEventTicket[msg.sender][_eventId] = true;
-        return supply.current();
-    }
 
-    function tokenURI(uint256 _tokenId)
-        public
-        view
-        virtual
-        override
-        returns (string memory)
-    {
-        require(
-            _exists(_tokenId),
-            "ERC721Metadata: URI query for nonexistent token"
-        );
-
-        if (revealed == false) {
-            return hiddenMetadataUri;
-        }
-
-        string memory currentBaseURI = _baseURI();
-        return
-            bytes(currentBaseURI).length > 0
-                ? string(
-                    abi.encodePacked(
-                        currentBaseURI,
-                        _tokenId.toString(),
-                        uriSuffix
-                    )
-                )
-                : "";
-    }
-
-    function setRevealed(bool _state) public onlyOwner {
-        revealed = _state;
+        emit mintingEventTicket(_eventId, tokenId, _centralizedId);
+        return tokenId;
     }
 
     function setCost(uint256 _cost) public onlyOwner {
@@ -191,49 +241,18 @@ contract TicketNFT is ERC721, Ownable {
         systemPercent = _percent;
     }
 
-    function setHiddenMetadataUri(string memory _hiddenMetadataUri)
+    function setCreatorsPermission(bool _allow) public onlyOwner {
+        creatorsPermission = _allow;
+    }
+
+    function authorizeAddressToCreateEvent(address _address, bool _canCreate)
         public
         onlyOwner
     {
-        hiddenMetadataUri = _hiddenMetadataUri;
+        isEventCreator[_address] = _canCreate;
     }
 
-    function setUriPrefix(string memory _uriPrefix) public onlyOwner {
-        uriPrefix = _uriPrefix;
-    }
-
-    function setUriSuffix(string memory _uriSuffix) public onlyOwner {
-        uriSuffix = _uriSuffix;
-    }
-
-    function setPaused(bool _state) public onlyOwner {
-        paused = _state;
-    }
-
-    function setEventCreator(address _address, bool _canCreate)
-        public
-        onlyOwner
-    {
-        eventCreator[_address] = _canCreate;
-    }
-
-    function withdraw() public onlyOwner {
-        (bool os, ) = payable(owner()).call{value: address(this).balance}("");
-        require(os);
-    }
-
-    function _mintLoop(address _receiver, uint256 _mintAmount) internal {
-        for (uint256 i = 0; i < _mintAmount; i++) {
-            supply.increment();
-            _safeMint(_receiver, supply.current());
-        }
-    }
-
-    function _baseURI() internal view virtual override returns (string memory) {
-        return uriPrefix;
-    }
-
-    function getAllEvents(address creator)
+    function getAllEventsOf(address creator)
         public
         view
         returns (Event[] memory)
@@ -245,15 +264,80 @@ contract TicketNFT is ERC721, Ownable {
         return ticketIdToTicketEvent[id];
     }
 
-    function getUserTickets() public view returns (uint256[] memory) {
-        return addressToTickets[msg.sender];
-    }
-
     function getUserTicketsByAddress(address _address)
         public
         view
         returns (uint256[] memory)
     {
         return addressToTickets[_address];
+    }
+
+    function withdraw() public onlyOwner {
+        (bool os, ) = payable(owner()).call{value: address(this).balance}("");
+        require(os);
+    }
+
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 tokenId
+    ) internal override whenNotPaused {
+        super._beforeTokenTransfer(from, to, tokenId);
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyOwner
+    {}
+
+    // The following functions are overrides required by Solidity.
+
+    function _burn(uint256 tokenId)
+        internal
+        override(ERC721Upgradeable, ERC721URIStorageUpgradeable)
+    {
+        uint256 eventId = ticketIdToTicketEvent[tokenId];
+        delete hasEventTicket[ownerOf(tokenId)][eventId];
+        super._burn(tokenId);
+        emit burningTicket(tokenId);
+    }
+
+    function tokenURI(uint256 tokenId)
+        public
+        view
+        override(ERC721Upgradeable, ERC721URIStorageUpgradeable)
+        returns (string memory)
+    {
+        return super.tokenURI(tokenId);
+    }
+
+    function burnEvent(uint256 _eventId) public returns (bool) {
+        Event memory getEvent = idToEvent[_eventId];
+        require(
+            getEvent.creator == msg.sender || msg.sender == owner(),
+            "Only event owner!"
+        );
+
+        delete idToEvent[_eventId];
+        emit deletingEvent(_eventId);
+        return true;
+    }
+
+    function changeEventPauseState(uint256 _eventId, bool paused)
+        public
+        returns (bool)
+    {
+        Event memory getEvent = idToEvent[_eventId];
+        require(
+            getEvent.creator == msg.sender || msg.sender == owner(),
+            "Only event owner!"
+        );
+        require(getEvent.paused != paused, "Not try to set same value!");
+
+        getEvent.paused = paused;
+        idToEvent[_eventId] = getEvent;
+        emit pausingEvent(_eventId, paused);
+        return true;
     }
 }
